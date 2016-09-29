@@ -1,52 +1,54 @@
-# Balancing Spark
+# Balancing Spark – Bin Packing to Solve Data Skew
 
-On a recent project through Silverpond I found myself working with some of our resident data scientists on some large scale electrical meter data analysis. My job was to write a harness to run a number of candidate models, written in Python. The models needed to run over all the smart meter data in the electricity network using [PySpark](http://spark.apache.org/docs/latest/api/python/index.html). PySpark is the [Python](https://www.python.org/) API to [Apache Spark](http://spark.apache.org/docs/latest/index.html). We have been using Spark for scalable large batch processing jobs of late.
+Here at Silverpond we love our [functional programming](https://en.wikipedia.org/wiki/Functional_programming), so much so that we are helping  run Melbourne's first functional programming conference, [Compose](http://www.composeconference.org/). So of course we use [Spark](http://spark.apache.org/) for large, scalable batch processing jobs. Recently I worked with some of our resident data scientists on large-scale electrical meter data analysis.  My job was to write a harness to run a number of candidate models, written in Python. The models needed to run over all the smart meter data in the electricity network using [PySpark](http://spark.apache.org/docs/latest/api/python/index.html). PySpark is the [Python](https://www.python.org/) API to [Apache Spark](http://spark.apache.org/docs/latest/index.html).
 
-I hadn't done a lot in this area previously. It was a crash course in distributed computing. Having tangled with this beast I came through the other side with my fair share of cuts and bruises. So am I now dusting myself off and ready to share some lessons learned.
+An issue I ran into fairly early on in our adventures in Spark land was data skew. The uneven distribution of workload that ensued made for inefficient clusters. Having tangled with this beast I came through the other side with my fair share of cuts and bruises. So am I now dusting myself off and ready to share some lessons learned. I’ll share how I identified the data skew to the two solutions I tried (repartitioning and bin packing) and finally their effects on processing times. 
 
 All the example code for this blog post can be found on github at [https://github.com/jsofra/bin-packing](https://github.com/jsofra/bin-packing).
 
+Let’s start with the basics:
+
 ## What is Spark?
 
-Spark is a general-purpose, distributed cluster computing engine. Here at Silverpond we love our [functional programming](https://en.wikipedia.org/wiki/Functional_programming), so much so that we are helping  run Melbourne's first functional programming conference, [Compose](http://www.composeconference.org/). Spark is written in [Scala](www.scala-lang.org/) which means it inherits some of Scala's functional flavour so right out of the box the API has a nice feel. This functional flavour is on display in Spark's central abstraction, the [Resilient Distributed Datasets (RDD)](http://spark.apache.org/docs/latest/programming-guide.html#resilient-distributed-datasets-rdds). RDD's are an immutable, partitioned, distributed data structure.
+Spark is a general-purpose, distributed cluster computing engine. Spark is written in [Scala](www.scala-lang.org/) which means it inherits some of Scala's functional flavour, giving the API a nice feel right out of the box. This functional flavour is on display in Spark's central abstraction, the [Resilient Distributed Datasets (RDD)](http://spark.apache.org/docs/latest/programming-guide.html#resilient-distributed-datasets-rdds). RDD's are an immutable, partitioned, distributed data structure.
 
 ![](blog_img/RDD.png)
 
 All distributed computation in Spark is done via **transformations** and **actions** over the RDD's. Transformations are operations on RDD's that return a new transformed RDD, such as *map*, *filter*, *flatMap* etc. Actions are operations that run a computation on the RDD and return some value to the driver program, such as *reduce*, *count*, *take* etc.
 
-These operations should look familiar to anyone who has done some functional programming and their effect is as you would expect. The Spark magic is that the transformations will automatically be distributed in parallel across the cluster, whilst the actions may aggregate values and return a final result.
+These operations should look familiar to anyone who has done some functional programming and their effect is, as you would expect. The Spark magic is that the transformations will automatically be distributed in parallel across the cluster, whilst the actions may aggregate values and return a final result.
 
-## Uneven Distribution
+## Uneven Distribution - Identifying Data Skew
 
-An issue I ran into fairly early on in our adventures in Spark land was data skew. The first time I realised that there may be uneven distribution of computation on the cluster was when I was reviewing the [Ganglia](http://ganglia.info/) metrics for my cluster (we were running [EMR](https://aws.amazon.com/emr/) clusters) and noticed a strange pattern in the memory usage.
+The first time I realised that there may be uneven distribution of computation on the cluster was when I was reviewing the [Ganglia](http://ganglia.info/) metrics for my cluster (we were running [EMR](https://aws.amazon.com/emr/) clusters) and noticed a strange pattern in the memory usage.
 
 ![](blog_img/memory_data_skew.png)
 
-As can be seen in the Ganglia memory trace above the memory usage ramps up quickly at the start of the job run and then experiences step changes in usage over time. As nodes in the cluster finish processing they release their memory and that is reflected in the trace. We can see that one node seems to be processing data long after all the other nodes have finished processing. This is confirmed by looking at the load traces for the individual nodes (see below), we can see the fist node continues to have load after all the other have completed.
+As can be seen in the Ganglia memory trace above, memory usage ramps up quickly at the start of the job run and then reduces in steps over time. As nodes in the cluster finish processing they release their memory and that is reflected in the trace. We can see that one node seems to be processing data long after all the other nodes have finished processing. This is confirmed by looking at the load traces for the individual nodes (see below), we can see the fist node continues to process load after all the other have completed.
 
 ![](blog_img/node1_load.png) ![](blog_img/node2_load.png) ![](blog_img/node3_load.png) ![](blog_img/node4_load.png)
 
-It was clear from this that we had an uneven distribution of work across the cluster, one node was doing all the heavy lifting whilst others did very little. This is obviously inefficient. There was unused capacity in the cluster that we should be able to harness.
+It was clear from this that we had an uneven distribution of work across the cluster; one node was doing all the heavy lifting whilst others did very little. This is obviously inefficient. There was unused capacity in the cluster that we should be able to harness.
 
-So, why the uneven distribution of work? From looking at my code, it didn't seem to be an algorithmic issue. The core of the code was simple. It was mapping a function over each transformer in the the electrical network. Implicitly I had assumed that Spark would do a good job of distributing that work. Spark partitions the data across the cluster and workers in each node are sent a mapping function (a task) to compute on their portion of the data. I thought this assumption still held true. I decided to have a look at the Spark UI to see what is going on with those workers:
+So, why the uneven distribution of work? From looking at my code, it didn't seem to be an algorithmic issue. The core of the code was simple. It was mapping a function over each transformer in the electrical network. Implicitly I had assumed that Spark would do a good job of distributing that work. Spark partitions the data across the cluster and workers in each node are sent a mapping function (a task) to compute on their portion of the data. I thought this assumption still held true. I decided to have a look at the Spark UI to see what was going on with those workers:
 
 <iframe src="sparkui_skew.html#executor_metrics" height="500" width="100%" style="overflow-x:hidden; overflow-y:scroll;"></iframe>
 
-We can see that the tasks all take varying amounts of time to complete, which is what we expected. More interestingly we see in the aggregated metrics for the executors (JVM instances that workers run on) and the tasks list that all the executors and tasks have very varied input and output record sizes. So maybe it was the data? Each node is doing more or less work not because of computation complexity but because of the amount of data they processed.
+We can see that all tasks take varying amounts of time to complete, which is to be expected. More interestingly we see in the aggregated metrics for the executors (JVM instances that workers run on) and the task list that all the executors and tasks have very varied input and output record sizes. So maybe it was the data? Each node is doing more or less work not because of computation complexity but because of the amount of data they processed.
 
 I realised the root of the problem: we were running the models across meter readings that were being grouped by transformer, on a per transformer basis.
 
 ![](blog_img/groupby.png)
 
-It so happened that there is a wildly varying number of meters per transformer, hence the differing amount of data each task was having to process. We had a data skew problem due to the natural hierarchy in our data!
+It so happened that the number of meters per transformer varied wildly, causing each task to process different amounts of data. We had a data skew problem due to the natural hierarchy in our data!
 
 ## Project Gutenberg Data Skew Example
 
-In the rest of this post I will outline one technique I used to addressed our data skew. I will provide a small example and solution that is more easily digestible than the model we were running on the electrical network.
+In the rest of this post I will outline some techniques I used to addressed our data skew. I will provide a small example that is more easily digestible than the model we were running on the electrical network.
 
-The example makes use of the text of ebooks in the [Project Gutenberg](https://www.gutenberg.org/) collection. The ebooks are grouped using the [Gutenberg Bookshelves](https://www.gutenberg.org/w/index.php?title=Category:Bookshelf) (bookshelves are categories e.g. Adventure, Sci-Fi, Reglious Texts etc) and frequency analysis is performed on these groups. In this way we are able produce a natural data skew since there is a wide variance in the number and size of the texts in each bookshelf.
+The example makes use of ebook text from the [Project Gutenberg](https://www.gutenberg.org/) collection. The ebooks are grouped using the [Gutenberg Bookshelves](https://www.gutenberg.org/w/index.php?title=Category:Bookshelf) (bookshelves are categories e.g. Adventure, Sci-Fi, Religious Texts etc) and frequency analysis is performed on these groups. In this way we are able produce a natural data skew since there is a wide variance in the number and size of the texts in each bookshelf.
 
-The Frequency Analysis used is very vanilla [Term Frequency - Inverse Document Frequency (TF-IDF)](https://en.wikipedia.org/wiki/Tf%E2%80%93idf).
+The Frequency Analysis used is the very vanilla [Term Frequency - Inverse Document Frequency (TF-IDF)](https://en.wikipedia.org/wiki/Tf%E2%80%93idf).
 
 <script type="text/javascript" async
   src="https://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-MML-AM_CHTML">
@@ -71,7 +73,7 @@ Our aim is to search the Gutenberg texts in a couple of ways, given some search 
 1. Find the text in each Gutenberg bookshelf that those terms are most important to.
 2. Find the Gutenberg bookshelf that those terms are most important to.
 
-The code in the example is all written in [Clojure](http://clojure.org/) using the [Sparkling](http://gorillalabs.github.io/sparkling/) library, a Clojure API for Spark. This can be easily translated to any other language with Spark support. Clojure turned out to be a great way to work with Spark. It is functionally focused, has a great REPL for interactive development, and being on the JVM means a much nicer deployment story than Python.
+The code in the example is  written in [Clojure](http://clojure.org/) using the [Sparkling](http://gorillalabs.github.io/sparkling/) library, a Clojure API for Spark. This can be easily translated to any other language with Spark support. Clojure turned out to be a great way to work with Spark. It is functionally focused, has a great REPL for interactive development, and being on the JVM makes it much easier to deploy than Python.
 
 ## Fixing the Skew
 
@@ -79,9 +81,9 @@ So what can we do about data skew? When we look at data by partition we can iden
 
 ![](blog_img/rdd_partitions.png)
 
-### Simply Partitioning
+### Solution 1: Simply Partitioning
 
-So can we simply partition our way out of this? What if we partition our data to the number of units of work we have? In our case we are performing the TF-IDF over each book shelf so we can partition the data by the number of book shelves, 228. That means there will be 228 tasks to be performed in parallel.
+So can we simply partition our way out of this? What if we partition our data to the number of units of work we have? In our case we are performing the TF-IDF over each bookshelf so we can partition the data by the number of bookshelves, 228. That means there will be 228 tasks to be performed in parallel.
 
 ``` clojure
 (spark/repartition 228 bookshelves)
@@ -96,12 +98,12 @@ The partitioning did in fact improve the performance. In fact it improved it gre
 <ul>
 <li>Overhead from small tasks
 <ul>
-<li>We can see a number of very small tasks, there is significant overhead in each Spark task.</li>
+<li>For a number of very small tasks, there is significant overhead in each Spark task.</li>
 </ul>
 </li>
 <li>Poor scheduling
 <ul>
-<li>Since we have less workers than tasks, tasks will be scheduled across workers in the cluster. At the end of the process we can see a number of very large tasks were running. This is inefficient since better scheduling would have allowed for a number smaller tasks to run in parallel to the larger tasks. We can still see unused capacity in the cluster.</li>
+<li>Since we have fewer workers than tasks, tasks will be scheduled across workers in the cluster. At the end of the process we can see a number of very large tasks were running. This is inefficient as better scheduling would have allowed for a number of smaller tasks to run in parallel to the larger tasks. We can still see unused capacity in the cluster.</li>
 </ul>
 </li>
 <li>Not enough hardware
@@ -118,18 +120,18 @@ The partitioning did in fact improve the performance. In fact it improved it gre
 
 ### Packing Problems
 
-To my mind Spark doesn't have enough information about the shape of our data to know how to best schedule the tasks. But Spark does allow us to use our own custom partitioning scheme. Therefore could we create more balanced computation across the workers be partitioning the data into more evenly weighted chunks? If so we'd be less reliant on Spark scheduling of the tasks.
+To my mind Spark doesn't have enough information about the shape of our data to know how to best schedule the tasks. But Spark does allow us to use our own custom partitioning scheme. Could we create more balanced computation across the workers and partition data into more evenly weighted chunks? If so we'd be less reliant on Spark's scheduling of tasks.
 
 The problem roughly falls into a class of optimization problems known as [packing problems](https://en.wikipedia.org/wiki/Packing_problems). These are NP-hard problems so we need to make use of some kind of heuristical method when implementing a solution.
 
-#### Bin-packing
+#### Solution 2: Bin-packing
 
 Our problem seems most closely related to the [Bin Packing](https://en.wikipedia.org/wiki/Bin_packing_problem) problem (minimum number of bins of a certain volume) or maybe the [Multiprocessor Scheduling](https://en.wikipedia.org/wiki/Multiprocessor_scheduling) problem (pack into a specific number of bins). We will look at two Bin Packing methods:
 
 1. First Fit (smallest number of fixed sized bins)
 2. First Fit + Smallest Bin (fixed number of bins)
 
-*Note:* These methods were chosen for their ease of implementation, the actual methods are somewhat orthogonal to solving this partitioning problem in Spark. We just need a way to create even partitions. Note also that these methods require the items being packed to be sorted in descending order based on the weight given to each item. This may be prohibitive for certain application if it requires shuffling of data around the cluster. In this case we use the number of books in a bookshelf as our weight and the book urls as our data so it is inexpensive to calculate.
+*Note:* These methods were chosen for their ease of implementation, the actual methods are somewhat orthogonal to solving this partitioning problem in Spark. We just need a way to create even partitions. Note also that these methods require the items being packed, to be sorted in descending order based on the weight given to each item. This may be prohibitive for certain applications if it requires shuffling of data around the cluster. In this case we use the number of books in a bookshelf as our weight and the book URLs as our data so it is inexpensive to calculate.
 
 Let's look at some implementations for those two methods. First I define some helper functions to add an item to a bin, select the a bin that an item fits in to, and add a new bin:
 
@@ -154,9 +156,9 @@ Let's look at some implementations for those two methods. First I define some he
 
 ```
 
-#### First Fit Packing
+#### First-Fit Packing
 
-With first fit packing we aim to create the smallest number of fixed size bins that the items fit into. We iteratively place items into the first bin that it will fit into until there are no items left. Thus:
+With first-fit packing we aim to create the smallest number of fixed-sized bins that the items fit into. We iteratively place items into the first bin that they will fit into until there are no items left. Thus:
 
 <ol>
 <li>start with a single empty bin</li>
@@ -192,17 +194,17 @@ The code below shows this implemented in Clojure using a **reduce** over all the
 
 ```
 
-#### First Fit + Smallest Bin Packing
+#### First-Fit + Smallest Bin Packing
 
-First fit works pretty well. But we're working in a hardware constrained environment. To optimise code for the particular hardware it would be good to have a fixed number of bins instead of a fixed bin size. That way if we have 16 workers we can create 16 evenly sized bins, one for each worker to process.
+First-fit works pretty well. But we're working in a hardware-constrained environment. To optimise code for the particular hardware it would be good to have a fixed number of bins instead of a fixed bin size. That way if we have 16 workers we can create 16 evenly-sized bins, one for each worker to process.
 
-To achieve this I have slightly modified the first fit process above so that instead of growing the number of bins when we have an item that will not fit we find the bin with the smallest number of items in it and we add the item to that bin. Thus, once all the bins are 'full' the rest of the items will simply get distributed one by one to the emptiest bin at the time. This only works because we are using a sorted list of items. The process is thus:
+To achieve this I have slightly modified the first-fit process above. Instead of growing the number of bins when we have an item that will not fit we find the bin with the smallest number of items in it and we add the item to that bin. Thus, once all the bins are 'full' the rest of the items will simply get distributed one by one to the emptiest bin at the time. This only works because we are using a sorted list of items. The process is thus:
 
 <ol>
 <li>start with a single empty bin</li>
 <ul><li>maybe the size of the largest item</li></ul>
 <li>for each item find the first bin that it will fit into and place it into the bin</li>
-<li>if no bins will fit the item add it too the bin that has the least in it</li>
+<li>if no bins will fit the item add it to the bin that has the least in it</li>
 <li>continue until all items are exhausted</li>
 </ol>
 
@@ -262,7 +264,7 @@ Let's look at the code for creating these indices:
 
 ```
 
-Ok so we now have a map of item keys to bin indices, **item-indices** and a count of the number of bins, **bin-count**, all we need to do now is create a **Partitioner** implementation and we can repartition our data. To create the **Partitioner** in Clojure we can use **proxy** to create an anonymous implementation of the abstract class. Maps, such at **item-indices** act as functions that take a key and return a value. Thus to implement **getPartition** the map can be passed through and the key applied to it. We return **bin-count** from **numPartitions** and we are done.
+Ok so we now have a map of item keys to bin indices, **item-indices** and a count of the number of bins, **bin-count** - all we need to do now is create a **Partitioner** implementation and we can repartition our data. To create the **Partitioner** in Clojure we can use **proxy** to create an anonymous implementation of the abstract class. Maps, such at **item-indices** act as functions that take a key and return a value. Thus to implement **getPartition** the map can be passed through and the key applied to it. We return **bin-count** from **numPartitions** and we are done.
 
 A complete bin packing repartitioning may look something like this:
 
@@ -312,31 +314,35 @@ I ran the TF-IDF over the Gutenberg bookshelves on an [EMR](https://aws.amazon.c
 On this EMR cluster I applied the TF-IDF algorithm using 3 different methods:
 
 <ul>
-<li><span style="color:red"><b>Skewed</b></span> S3 data, without re-partitioning</li>
+<li><span style="color:red"><b>Our Starting Point (Skewed):</b></span> S3 data, without re-partitioning</li>
 <ul><li>38 partitions</li></ul>
-    <li><span style="color:red"><b>Re-partitioned</b></span> data, maximally partitioned by number of bookshelves</li>
+    <li><span style="color:red"><b>Solution 1 (Re-partitioned):</b></span> Maximally partitioned by number of bookshelves</li>
 <ul><li>228 partitions</li></ul>
-<li><span style="color:red"><b>Bin packed</b></span> data, re-partitioned using bin packing method</li>
+<li><span style="color:red"><b>Solution 2 (Bin-packed):</b></span> Re-partitioned using bin packing method</li>
 <ul><li>16 partitions</li></ul>
 </ul>
 
 Using these three methods run times were as follows:
 
 <ul>
-<li><span style="color:red"><b>Skewed</b></span></li>
+<li><span style="color:red"><b>Our Starting Point (Skewed):</b></span></li>
 <ul><li>~55 mins</li></ul>
-<li><span style="color:red"><b>Re-partitioned</b></span></li>
+<li><span style="color:red"><b>Solution 1 (Re-partitioned):</b></span></li>
 <ul><li>~25 mins</li></ul>
-<li><span style="color:red"><b>Bin packed</b></span></li>
+<li><span style="color:red"><b>Solution 2 (Bin-packed):</b></span></li>
 <ul><li>15 mins</li></ul>
 </ul>
 
-Using maximal partitioning on the Gutenberg data set shows a significant improvement and an even greater improvement when using the bin packing method. The bin packing method also has the most predictable run time. It was always 15 mins where as the other methods fluctuated due to the unpredictable schedule of the different sized tasks. If we look at the Spark UI for a bin packed run we can see just how evenly the tasks were distributed:
+Using maximal partitioning on the Gutenberg data set shows a significant improvement and an even greater improvement when using the bin packing method. The bin packing method also has the most predictable run time. It was always 15 mins whereas the other methods fluctuated due to the unpredictable schedule of the different sized tasks. If we look at the Spark UI for a bin packed run we can see just how evenly the tasks were distributed:
 
 <iframe src="bin_packed.html" height="500" width="100%" style="overflow-x:hidden; overflow-y:scroll;"></iframe>
 
 ## Conclusions
 
-Data skew in a distributed computation has the potential to cause massive inefficiencies. It is really important to consider how your data is partitioned across the cluster. You should aim to avoid shuffling data around nodes in the cluster. Under circumstances where you are suffering data skew it may be more efficient to repartition your data prior to performing you computation in order to more evenly distribute across the cluster and gain more parallelism.
+Data skew in a distributed computation has the potential to cause massive inefficiencies. It is really important to consider how your data is partitioned across the cluster. You should aim to avoid shuffling data around nodes in the cluster. Under circumstances where you are suffering data skew, it may be more efficient to repartition your data prior to performing you computation. This should distribute work more evenly across the cluster and ensure better parallelism.
 
-Bin packing can beat out simple partitioning in limited resource environments and is quite straight forward to implement. It may enable you to optimised the capacity of you cluster and allow you to use a smaller cluster. Bin packing may also make the computation's run time more predictable. Without bin packing Spark will unpredictably schedule tasks regardless of their size causing more variance in the overall run time.
+Bin packing can beat simple partitioning in limited-resource environments and is quite straightforward to implement. It may enable you to optimise the capacity of your cluster and allow you to use a smaller cluster. Bin packing may also make the computation's run time more predictable. Without bin packing Spark will unpredictably schedule tasks regardless of their size causing more variance in the overall run time.
+
+All the example code for this blog post can be found on github at https://github.com/jsofra/bin-packing.
+
+Do you have a data skew problem in your Spark setup? I’d be interested to hear how you dealt with it in the comments below.

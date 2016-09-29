@@ -1,8 +1,8 @@
 # Balancing Spark – Bin Packing to Solve Data Skew
 
-Here at Silverpond we love our [functional programming](https://en.wikipedia.org/wiki/Functional_programming), so much so that we are helping  run Melbourne's first functional programming conference, [Compose](http://www.composeconference.org/). So of course we use [Spark](http://spark.apache.org/) for large, scalable batch processing jobs. Recently I worked with some of our resident data scientists on large-scale electrical meter data analysis.  My job was to write a harness to run a number of candidate models, written in Python. The models needed to run over all the smart meter data in the electricity network using [PySpark](http://spark.apache.org/docs/latest/api/python/index.html). PySpark is the [Python](https://www.python.org/) API to [Apache Spark](http://spark.apache.org/docs/latest/index.html).
+Here at Silverpond we love our [functional programming](https://en.wikipedia.org/wiki/Functional_programming), so much so that we are helping  run Melbourne's first functional programming conference, [Compose](http://www.composeconference.org/). So [Spark](http://spark.apache.org/) seemed like a natural fit for large, scalable batch processing jobs. Recently I worked with some of our resident data scientists on large-scale electrical meter data analysis.  My job was to write a harness to run a number of candidate models, written in Python. The models needed to run over all the smart meter data in the electricity network using [PySpark](http://spark.apache.org/docs/latest/api/python/index.html). PySpark is the [Python](https://www.python.org/) API to [Apache Spark](http://spark.apache.org/docs/latest/index.html).
 
-An issue I ran into fairly early on in our adventures in Spark land was data skew. The uneven distribution of workload that ensued made for inefficient clusters. Having tangled with this beast I came through the other side with my fair share of cuts and bruises. So am I now dusting myself off and ready to share some lessons learned. I’ll share how I identified the data skew to the two solutions I tried (repartitioning and bin packing) and finally their effects on processing times. 
+An issue I ran into fairly early on in our adventures in Spark land was data skew. The uneven distribution of workload that ensued made for inefficient clusters. Having tangled with this beast I came through the other side with my fair share of cuts and bruises. So am I now dusting myself off and ready to share some lessons learned. I’ll share how I identified the data skew to the two solutions I tried (repartitioning and bin packing) and finally their effects on processing times.
 
 All the example code for this blog post can be found on github at [https://github.com/jsofra/bin-packing](https://github.com/jsofra/bin-packing).
 
@@ -73,7 +73,7 @@ Our aim is to search the Gutenberg texts in a couple of ways, given some search 
 1. Find the text in each Gutenberg bookshelf that those terms are most important to.
 2. Find the Gutenberg bookshelf that those terms are most important to.
 
-The code in the example is  written in [Clojure](http://clojure.org/) using the [Sparkling](http://gorillalabs.github.io/sparkling/) library, a Clojure API for Spark. This can be easily translated to any other language with Spark support. Clojure turned out to be a great way to work with Spark. It is functionally focused, has a great REPL for interactive development, and being on the JVM makes it much easier to deploy than Python.
+The code in the example is written in [Clojure](http://clojure.org/) using the [Sparkling](http://gorillalabs.github.io/sparkling/) library, a Clojure API for Spark. This can be easily translated to any other language with Spark support. Clojure turned out to be a great way to work with Spark. It is functionally focused, has a great REPL for interactive development, and being on the JVM makes it much easier to deploy than Python.
 
 ## Fixing the Skew
 
@@ -98,7 +98,7 @@ The partitioning did in fact improve the performance. In fact it improved it gre
 <ul>
 <li>Overhead from small tasks
 <ul>
-<li>For a number of very small tasks, there is significant overhead in each Spark task.</li>
+<li>There are a number of very small tasks, there can be significant overhead in each Spark task.</li>
 </ul>
 </li>
 <li>Poor scheduling

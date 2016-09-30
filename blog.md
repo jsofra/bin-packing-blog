@@ -30,11 +30,22 @@ As can be seen in the Ganglia memory trace above, memory usage ramps up quickly 
 
 It was clear from this that we had an uneven distribution of work across the cluster; one node was doing all the heavy lifting whilst others did very little. This is obviously inefficient. There was unused capacity in the cluster that we should be able to harness.
 
-So, why the uneven distribution of work? From looking at my code, it didn't seem to be an algorithmic issue. The core of the code was simple. It was mapping a function over each transformer in the electrical network. Implicitly I had assumed that Spark would do a good job of distributing that work. Spark partitions the data across the cluster and workers in each node are sent a mapping function (a task) to compute on their portion of the data. I thought this assumption still held true. I decided to have a look at the Spark UI to see what was going on with those workers:
+So, why the uneven distribution of work? From looking at my code, it didn't seem to be an algorithmic issue. The core of the code was simple. It was mapping a function over each transformer in the electrical network. Implicitly I had assumed that Spark would do a good job of distributing that work. Spark partitions the data across the cluster and workers in each node are sent a mapping function (a task) to compute on their portion of the data. I thought this assumption still held true. I decided to have a look at the Spark UI to see what was going on with those workers.
 
-<iframe src="sparkui_skew.html#executor_metrics" height="500" width="100%" style="overflow-x:hidden; overflow-y:scroll;"></iframe>
+The Spark UI allows you to look at the details of each processing stage. It shows detail information and metrics about the time taken to execute each individual task, amount of input data processed and the amount of output data produced. At the top of the page is a visual chart showing each of the tasks per executor, that looks like this:
 
-We can see that all tasks take varying amounts of time to complete, which is to be expected. More interestingly we see in the aggregated metrics for the executors (JVM instances that workers run on) and the task list that all the executors and tasks have very varied input and output record sizes. So maybe it was the data? Each node is doing more or less work not because of computation complexity but because of the amount of data they processed.
+![](blog_img/init_sparkui.png)
+
+The task chart gives a good high level overview of what happened in the cluster. It allows you to quickly see if tasks were delayed or if there was excessive data shuffling, or deserialization happening. In my case none of these were an issue. If we zoom out to see the entire chart we can start to get an idea of what may be going on:
+
+![](blog_img/sparkui_skew_zoom.png)
+
+We can see that all tasks take varying amounts of time to complete, which is to be expected, but the variation is quite large. If we look the aggregated metrics for the executors (JVM instances that workers run on) we see that the executors have very varied output record sizes:
+
+![](blog_img/skew_metrics.png)
+
+
+So maybe it was the data? Each node is doing more or less work not because of computation complexity but because of the amount of data they processed.
 
 I realised the root of the problem: we were running the models across meter readings that were being grouped by transformer, on a per transformer basis.
 
@@ -89,9 +100,13 @@ So can we simply partition our way out of this? What if we partition our data to
 (spark/repartition 228 bookshelves)
 ```
 
-Let's have a look at the Spark UI for this repartitioning and see how it compares to the previous skewed example:
+Let's have a look at the Spark UI for this repartitioning and see how it compares to the previous skewed example, here is the zoomed out task chart (this is from the end of the run, the full task chart consisted of three pages):
 
-<iframe src="partitioning3.html#viz" height="500" width="100%" style="overflow-x:hidden; overflow-y:scroll;"></iframe>
+![](blog_img/sparkui_partitioning_zoom.png)
+
+And here we can see the output record sizes are still somewhat unbalanced:
+
+![](blog_img/partitioned_metrics.png)
 
 The partitioning did in fact improve the performance. In fact it improved it greatly. We went from ~55 mins to ~25 mins on the same hardware, but there was still a number of issues:
 
@@ -103,7 +118,7 @@ The partitioning did in fact improve the performance. In fact it improved it gre
 </li>
 <li>Poor scheduling
 <ul>
-<li>Since we have fewer workers than tasks, tasks will be scheduled across workers in the cluster. At the end of the process we can see a number of very large tasks were running. This is inefficient as better scheduling would have allowed for a number of smaller tasks to run in parallel to the larger tasks. We can still see unused capacity in the cluster.</li>
+<li>Since we have fewer workers than tasks, tasks will be scheduled across workers in the cluster. At the end of the process we can see a number of very large tasks were running. This is inefficient as better scheduling would have allowed for a number of smaller tasks to run in parallel to the larger tasks. We can still see unused capacity in the cluster, in fact we see that at the end of the run only 3 of the 4 executors are being utilised, the four has not been scheduled any further work.</li>
 </ul>
 </li>
 <li>Not enough hardware
@@ -335,7 +350,12 @@ Using these three methods run times were as follows:
 
 Using maximal partitioning on the Gutenberg data set shows a significant improvement and an even greater improvement when using the bin packing method. The bin packing method also has the most predictable run time. It was always 15 mins whereas the other methods fluctuated due to the unpredictable schedule of the different sized tasks. If we look at the Spark UI for a bin packed run we can see just how evenly the tasks were distributed:
 
-<iframe src="bin_packed.html" height="500" width="100%" style="overflow-x:hidden; overflow-y:scroll;"></iframe>
+![](blog_img/sparkui_binpacked_zoom.png)
+
+The output record sizes are also very even, with exactly 4 task per executor:
+
+![](blog_img/binpacked_metrics.png)
+
 
 ## Conclusions
 

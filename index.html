@@ -47,10 +47,20 @@ code > span.er { color: #ff0000; font-weight: bold; }
 <p>As can be seen in the Ganglia memory trace above, memory usage ramps up quickly at the start of the job run and then reduces in steps over time. As nodes in the cluster finish processing they release their memory and that is reflected in the trace. We can see that one node seems to be processing data long after all the other nodes have finished processing. This is confirmed by looking at the load traces for the individual nodes (see below), we can see the fist node continues to process load after all the other have completed.</p>
 <p><img src="blog_img/node1_load.png" /> <img src="blog_img/node2_load.png" /> <img src="blog_img/node3_load.png" /> <img src="blog_img/node4_load.png" /></p>
 <p>It was clear from this that we had an uneven distribution of work across the cluster; one node was doing all the heavy lifting whilst others did very little. This is obviously inefficient. There was unused capacity in the cluster that we should be able to harness.</p>
-<p>So, why the uneven distribution of work? From looking at my code, it didn't seem to be an algorithmic issue. The core of the code was simple. It was mapping a function over each transformer in the electrical network. Implicitly I had assumed that Spark would do a good job of distributing that work. Spark partitions the data across the cluster and workers in each node are sent a mapping function (a task) to compute on their portion of the data. I thought this assumption still held true. I decided to have a look at the Spark UI to see what was going on with those workers:</p>
-<iframe src="sparkui_skew.html#executor_metrics" height="500" width="100%" style="overflow-x:hidden; overflow-y:scroll;"></iframe>
-
-<p>We can see that all tasks take varying amounts of time to complete, which is to be expected. More interestingly we see in the aggregated metrics for the executors (JVM instances that workers run on) and the task list that all the executors and tasks have very varied input and output record sizes. So maybe it was the data? Each node is doing more or less work not because of computation complexity but because of the amount of data they processed.</p>
+<p>So, why the uneven distribution of work? From looking at my code, it didn't seem to be an algorithmic issue. The core of the code was simple. It was mapping a function over each transformer in the electrical network. Implicitly I had assumed that Spark would do a good job of distributing that work. Spark partitions the data across the cluster and workers in each node are sent a mapping function (a task) to compute on their portion of the data. I thought this assumption still held true. I decided to have a look at the Spark UI to see what was going on with those workers.</p>
+<p>The Spark UI allows you to look at the details of each processing stage. It shows detail information and metrics about the time taken to execute each individual task, amount of input data processed and the amount of output data produced. At the top of the page is a visual chart showing each of the tasks per executor, that looks like this:</p>
+<div class="figure">
+<img src="blog_img/init_sparkui.png" />
+</div>
+<p>The task chart gives a good high level overview of what happened in the cluster. It allows you to quickly see if tasks were delayed or if there was excessive data shuffling, or deserialization happening. In my case none of these were an issue. If we zoom out to see the entire chart we can start to get an idea of what may be going on:</p>
+<div class="figure">
+<img src="blog_img/sparkui_skew_zoom.png" />
+</div>
+<p>We can see that all tasks take varying amounts of time to complete, which is to be expected, but the variation is quite large. If we look the aggregated metrics for the executors (JVM instances that workers run on) we see that the executors have very varied output record sizes:</p>
+<div class="figure">
+<img src="blog_img/skew_metrics.png" />
+</div>
+<p>So maybe it was the data? Each node is doing more or less work not because of computation complexity but because of the amount of data they processed.</p>
 <p>I realised the root of the problem: we were running the models across meter readings that were being grouped by transformer, on a per transformer basis.</p>
 <div class="figure">
 <img src="blog_img/groupby.png" />
@@ -88,9 +98,14 @@ MathJax.Hub.Config({ TeX: { extensions: ["color.js"] },
 <h3 id="solution-1-simply-partitioning">Solution 1: Simply Partitioning</h3>
 <p>So can we simply partition our way out of this? What if we partition our data to the number of units of work we have? In our case we are performing the TF-IDF over each bookshelf so we can partition the data by the number of bookshelves, 228. That means there will be 228 tasks to be performed in parallel.</p>
 <pre class="sourceCode clojure"><code class="sourceCode clojure">(spark/repartition <span class="dv">228</span> bookshelves)</code></pre>
-<p>Let's have a look at the Spark UI for this repartitioning and see how it compares to the previous skewed example:</p>
-<iframe src="partitioning3.html#viz" height="500" width="100%" style="overflow-x:hidden; overflow-y:scroll;"></iframe>
-
+<p>Let's have a look at the Spark UI for this repartitioning and see how it compares to the previous skewed example, here is the zoomed out task chart (this is from the end of the run, the full task chart consisted of three pages):</p>
+<div class="figure">
+<img src="blog_img/sparkui_partitioning_zoom.png" />
+</div>
+<p>And here we can see the output record sizes are still somewhat unbalanced:</p>
+<div class="figure">
+<img src="blog_img/partitioned_metrics.png" />
+</div>
 <p>The partitioning did in fact improve the performance. In fact it improved it greatly. We went from ~55 mins to ~25 mins on the same hardware, but there was still a number of issues:</p>
 <ul>
 <li>
@@ -105,7 +120,7 @@ There are a number of very small tasks, there can be significant overhead in eac
 Poor scheduling
 <ul>
 <li>
-Since we have fewer workers than tasks, tasks will be scheduled across workers in the cluster. At the end of the process we can see a number of very large tasks were running. This is inefficient as better scheduling would have allowed for a number of smaller tasks to run in parallel to the larger tasks. We can still see unused capacity in the cluster.
+Since we have fewer workers than tasks, tasks will be scheduled across workers in the cluster. At the end of the process we can see a number of very large tasks were running. This is inefficient as better scheduling would have allowed for a number of smaller tasks to run in parallel to the larger tasks. We can still see unused capacity in the cluster, in fact we see that at the end of the run only 3 of the 4 executors are being utilised, the four has not been scheduled any further work.
 </li>
 </ul>
 </li>
@@ -363,8 +378,13 @@ Workers:
 </ul>
 
 <p>Using maximal partitioning on the Gutenberg data set shows a significant improvement and an even greater improvement when using the bin packing method. The bin packing method also has the most predictable run time. It was always 15 mins whereas the other methods fluctuated due to the unpredictable schedule of the different sized tasks. If we look at the Spark UI for a bin packed run we can see just how evenly the tasks were distributed:</p>
-<iframe src="bin_packed.html" height="500" width="100%" style="overflow-x:hidden; overflow-y:scroll;"></iframe>
-
+<div class="figure">
+<img src="blog_img/sparkui_binpacked_zoom.png" />
+</div>
+<p>The output record sizes are also very even, with exactly 4 task per executor:</p>
+<div class="figure">
+<img src="blog_img/binpacked_metrics.png" />
+</div>
 <h2 id="conclusions">Conclusions</h2>
 <p>Data skew in a distributed computation has the potential to cause massive inefficiencies. It is really important to consider how your data is partitioned across the cluster. You should aim to avoid shuffling data around nodes in the cluster. Under circumstances where you are suffering data skew, it may be more efficient to repartition your data prior to performing you computation. This should distribute work more evenly across the cluster and ensure better parallelism.</p>
 <p>Bin packing can beat simple partitioning in limited-resource environments and is quite straightforward to implement. It may enable you to optimise the capacity of your cluster and allow you to use a smaller cluster. Bin packing may also make the computation's run time more predictable. Without bin packing Spark will unpredictably schedule tasks regardless of their size causing more variance in the overall run time.</p>
